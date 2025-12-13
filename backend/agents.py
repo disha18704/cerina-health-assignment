@@ -17,19 +17,33 @@ def intent_router_node(state: AgentState):
     messages = state["messages"]
     last_message = messages[-1].content if messages else ""
     
-    classification_prompt = """You are an intent classifier. Determine if the user wants:
-- "cbt_exercise" - CBT exercise, therapy help, mental health support, or psychological assistance
-- "chat" - Normal chat, greetings, general questions, or small talk
+    classification_prompt = """You are an intent classifier. Analyze the user's message carefully.
+
+Return "chat" if ONLY IF the user is:
+- Greeting (hi, hello, hey, what's up)
+- Asking about your capabilities (what can you do, how do you work)
+- Making small talk (how are you, thanks, bye)
+- Asking general questions NOT related to mental health
+
+Return "cbt_exercise" if the user mentions:
+- Mental health issues (anxiety, depression, stress, insomnia, OCD, etc.)
+- Wants help with emotions or thoughts
+- Requests a CBT exercise, therapy tool, or mental health support
+- Describes any psychological challenge or symptom
 
 Examples:
 "hey" → chat
-"hello" → chat  
-"I need help with anxiety" → cbt_exercise
+"hello" → chat
+"what can you do?" → chat
+"how are you?" → chat
+"I have insomnia" → cbt_exercise
+"I'm feeling anxious" → cbt_exercise
 "create a CBT exercise" → cbt_exercise
+"help with negative thoughts" → cbt_exercise
 
 User message: "{message}"
 
-Classify the intent."""
+Think carefully. What is the intent?"""
 
     llm = get_llm()
     structured_llm = llm.with_structured_output(IntentClassification)
@@ -133,22 +147,22 @@ def safety_node(state: AgentState):
     current_draft = state.get("current_draft")
     draft_history = state.get("draft_history", [])
     
-    # Build review context
+
     version_info = f"Reviewing draft v{len(draft_history)}" if draft_history else "Reviewing initial draft"
     messages = [
         SystemMessage(content=SAFETY_PROMPT),
         HumanMessage(content=f"{version_info}\n\nDraft to review:\n{current_draft.model_dump_json()}")
     ]
     
-    # Generate critique
+
     structured_llm = get_llm().with_structured_output(Critique)
     response = structured_llm.invoke(messages)
     response.author = "Safety Guardian"
     
-    # Calculate safety score (simple heuristic)
+
     safety_score = 1.0 if response.approved else 0.5
     
-    # Create detailed scratchpad notes
+
     priority = "info" if response.approved else "critical"
     notes = [
         AgentNote(
@@ -159,7 +173,7 @@ def safety_node(state: AgentState):
         )
     ]
     
-    # Update metadata
+
     metadata = state.get("metadata") or ReviewMetadata()
     updated_metadata = ReviewMetadata(
         safety_score=safety_score,
@@ -188,16 +202,15 @@ def clinical_node(state: AgentState):
         HumanMessage(content=f"{version_info}\n\nDraft to review:\n{current_draft.model_dump_json()}")
     ]
     
-    # Generate critique
+
     structured_llm = get_llm().with_structured_output(Critique)
     response = structured_llm.invoke(messages)
     response.author = "Clinical Critic"
     
-    # Calculate empathy and clarity scores (simple heuristic)
+
     empathy_score = 1.0 if response.approved else 0.6
     clarity_score = 1.0 if response.approved else 0.6
-    
-    # Create detailed scratchpad notes
+
     priority = "info" if response.approved else "warning"
     notes = [
         AgentNote(
@@ -208,7 +221,7 @@ def clinical_node(state: AgentState):
         )
     ]
     
-    # Update metadata
+
     metadata = state.get("metadata") or ReviewMetadata()
     updated_metadata = ReviewMetadata(
         safety_score=metadata.safety_score,
@@ -229,14 +242,14 @@ def clinical_node(state: AgentState):
 def supervisor_node(state: AgentState):
     messages = [SystemMessage(content=SUPERVISOR_PROMPT)] + state["messages"]
     
-    # Build comprehensive state context
+
     current_draft = state.get("current_draft")
     draft_history = state.get("draft_history", [])
     critiques = state.get("critiques", [])
     metadata = state.get("metadata")
     last_reviewer = state.get("last_reviewer")
     
-    # Determine who rejected (if anyone)
+
     last_rejection_source = None
     if critiques:
         last_critique = critiques[-1]
@@ -255,7 +268,7 @@ Recent Scratchpad Notes:
 """
     scratchpad = state.get("scratchpad", [])
     if scratchpad:
-        recent_notes = scratchpad[-3:]  # Last 3 notes
+        recent_notes = scratchpad[-3:]  
         for note in recent_notes:
             context += f"\n- [{note.author}]: {note.content[:100]}"
     

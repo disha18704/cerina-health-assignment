@@ -23,11 +23,10 @@ class CBTChat:
     async def send_message(self, user_input: str):
         """Send a message and get the CBT exercise response"""
         
-        # Get current state to check if this is first message
+
         current_state = await self.app.aget_state(self.config)
         
         if not current_state.values:
-            # First message - initialize state
             initial_input = {
                 "messages": [HumanMessage(content=user_input)],
                 "current_draft": None,
@@ -41,7 +40,7 @@ class CBTChat:
             print("\n🤖 Processing your request...")
             print("   (Agents are collaborating...)\n")
             
-            # Stream the workflow
+
             async for event in self.app.astream(initial_input, self.config):
                 for key, value in event.items():
                     if key != "supervisor":
@@ -49,11 +48,11 @@ class CBTChat:
                         print(f"   → {agent_name} reviewing...", end="\r")
             
         else:
-            # Continue conversation
+
             print("\n🤖 Let me revise that for you...")
             print("   (Agents are working...)\n")
             
-            # Add message to existing state
+
             update_input = {
                 "messages": [HumanMessage(content=user_input)]
             }
@@ -64,7 +63,7 @@ class CBTChat:
                         agent_name = key.replace("_", " ").title()
                         print(f"   → {agent_name} reviewing...", end="\r")
         
-        # Get final state
+
         final_state = await self.app.aget_state(self.config)
         
         if final_state.values.get("current_draft"):
@@ -72,10 +71,10 @@ class CBTChat:
             metadata = final_state.values.get('metadata')
             scratchpad = final_state.values.get('scratchpad', [])
             
-            # Clear the processing line
+
             print(" " * 50, end="\r")
             
-            # Show summary
+
             print("\n" + "="*80)
             print(format_exercise_summary(draft, metadata, len(scratchpad)))
             print("="*80)
@@ -128,7 +127,7 @@ class CBTChat:
                     await self.get_full_exercise()
                     continue
                 
-                # Process the message
+
                 await self.send_message(user_input)
                 print()
                 

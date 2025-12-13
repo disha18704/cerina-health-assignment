@@ -4,4 +4,7 @@ langchain-openai
 langgraph-checkpoint-sqlite
 fastapi
 uvicorn
-pydan
+pydantic
+aiosqlite
+python-dotenv
+mcp
