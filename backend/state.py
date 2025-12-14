@@ -23,3 +23,6 @@ class AgentState(TypedDict):
     # Routing control
     next_worker: Optional[str]
     last_reviewer: Optional[str]  # Track who reviewed last for proper re-review cycles
+    
+    # Memory and retrieval
+    memory_result: Optional[dict]  # {intent, found, draft, confidence, query, original_message}

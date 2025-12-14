@@ -1,9 +1,12 @@
 import os
+import asyncio
+from typing import Optional
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from backend.state import AgentState
 from backend.models import ExerciseDraft, Critique, SupervisorDecision, AgentNote, DraftVersion, ReviewMetadata
 from backend.prompts import DRAFTER_PROMPT, SAFETY_PROMPT, CLINICAL_PROMPT, SUPERVISOR_PROMPT
+from backend.vector_store import search_drafts, initialize_vector_store, extract_topics
 from pydantic import BaseModel
 
 def get_llm():
@@ -12,6 +15,180 @@ def get_llm():
 class IntentClassification(BaseModel):
     intent: str
     reasoning: str
+
+class MemoryIntent(BaseModel):
+    """Intent classification for memory agent"""
+    intent: str  # "retrieve", "create_new", "modify_existing", "chat"
+    reasoning: str
+    query: Optional[str] = None  # Extracted query for retrieval searches
+
+async def memory_agent_node(state: AgentState):
+    """
+    Memory agent that handles intent classification and semantic draft retrieval.
+    Determines if user wants to retrieve an existing draft, create a new one, modify existing, or chat.
+    """
+    messages = state["messages"]
+    last_message = messages[-1].content if messages else ""
+    
+    # Intent classification prompt
+    classification_prompt = """You are a memory and retrieval agent. Analyze the user's message to determine their intent.
+
+Classify the intent as one of:
+1. "retrieve" - User wants to retrieve/view an existing draft they created earlier
+   Examples: "can I have the plan I made for anxiety", "show me my depression exercise", 
+   "what was that plan about stress", "give me the anxiety plan"
+   
+2. "create_new" - User wants to create a brand new draft/exercise
+   Examples: "make a plan for anxiety", "create an exercise for depression", 
+   "I need help with stress", "make another anxiety plan"
+   
+3. "modify_existing" - User wants to modify/edit an existing draft
+   Examples: "update my anxiety plan", "change the depression exercise", 
+   "edit the plan I made earlier"
+   
+4. "chat" - General conversation, greetings, questions about capabilities
+   Examples: "hello", "what can you do", "how are you"
+
+For "retrieve" intent, extract the key query terms (e.g., "anxiety", "depression", "stress plan").
+This will be used for semantic search.
+
+User message: "{message}"
+
+Think carefully about the user's intent."""
+    
+    llm = get_llm()
+    structured_llm = llm.with_structured_output(MemoryIntent)
+    
+    result = structured_llm.invoke([
+        SystemMessage(content=classification_prompt.format(message=last_message))
+    ])
+    
+    memory_result = {
+        "intent": result.intent,
+        "reasoning": result.reasoning,
+        "query": result.query or last_message,
+        "found": False,
+        "draft": None,
+        "confidence": 0.0,
+        "original_message": None
+    }
+    
+    # If creating new plan, clear old draft from state
+    if result.intent == "create_new" and state.get("current_draft"):
+        return {
+            "memory_result": memory_result,
+            "current_draft": None,
+            "draft_history": [],
+            "critiques": [],
+            "scratchpad": [],
+            "metadata": ReviewMetadata(),  # Reset metadata
+            "last_reviewer": None,
+            "next_worker": "intent_router"
+        }
+    
+    # Only perform semantic search if intent is explicitly "retrieve"
+    # Never search for "create_new" - always create fresh
+    if result.intent == "retrieve":
+        try:
+            # Use the extracted query or fall back to full message
+            search_query = result.query if result.query else last_message
+            
+            # Extract topics from the full message as well (in case LLM didn't extract properly)
+            # This ensures we catch topics even if LLM extraction missed them
+            query_topics_from_message = extract_topics(last_message)
+            query_topics_from_query = extract_topics(search_query)
+            query_topics = query_topics_from_message.union(query_topics_from_query)
+            
+            # If no topics found, try extracting from the full message more aggressively
+            if not query_topics:
+                # Fallback: check if message contains common mental health terms
+                message_lower = last_message.lower()
+                if 'anxiety' in message_lower:
+                    query_topics.add('anxiety')
+                if 'depression' in message_lower:
+                    query_topics.add('depression')
+                if 'stress' in message_lower:
+                    query_topics.add('stress')
+            
+            matches = await search_drafts(search_query, limit=5, threshold=0.75)  # Get more matches for better filtering
+            
+            if matches:
+                # Find the best match that has topic overlap - STRICT validation
+                best_match = None
+                for match in matches:
+                    # Use original_message as primary source for topic validation
+                    # This ensures we match based on user's original request, not edited content
+                    draft_title = match.get('title', '')
+                    original_message = match.get('original_message', '')
+                    # Prioritize original_message - it's the source of truth for what topic was requested
+                    draft_text = f"{original_message} {draft_title}"
+                    draft_topics = extract_topics(draft_text)
+                    
+                    # STRICT: If query has topics, MUST have topic match
+                    if query_topics:
+                        topic_overlap = query_topics.intersection(draft_topics)
+                        if topic_overlap:
+                            # Topics match - this is a valid match
+                            print(f"Memory agent: Found match with topic overlap {topic_overlap}. Query topics: {query_topics}, Draft topics: {draft_topics}, Draft title: {draft_title}")
+                            best_match = match
+                            break
+                        else:
+                            # Topics don't match - skip this match
+                            print(f"Memory agent: Skipping match - topic mismatch. Query topics: {query_topics}, Draft topics: {draft_topics}, Draft title: {draft_title}")
+                    else:
+                        # No topics in query - be very cautious
+                        # Only return if similarity is very high (>0.85) and we can't determine topic
+                        if match.get('similarity', 0) > 0.85:
+                            print(f"Memory agent: No topics in query, using high similarity match (>0.85)")
+                            best_match = match
+                            break
+                        # Otherwise skip - too risky to return wrong draft
+                
+                if best_match:
+                    # Topics match - proceed with returning the draft
+                    # Convert draft dict back to ExerciseDraft object
+                    from backend.models import ExerciseDraft
+                    draft_obj = ExerciseDraft(**best_match["draft"])
+                    
+                    memory_result.update({
+                        "found": True,
+                        "draft": best_match["draft"],  # Keep dict for JSON serialization
+                        "confidence": best_match["similarity"],
+                        "original_message": best_match["original_message"],
+                        "metadata": best_match.get("metadata", {})
+                    })
+                    
+                    # Also set current_draft so frontend can access it
+                    return {
+                        "memory_result": memory_result,
+                        "current_draft": draft_obj,
+                        "next_worker": "end",
+                        "metadata": ReviewMetadata(**best_match.get("metadata", {})) if best_match.get("metadata") else ReviewMetadata()
+                    }
+                else:
+                    # No match with topic overlap
+                    memory_result["found"] = False
+                    memory_result["reasoning"] += " (No draft found with matching topics)"
+        except Exception as e:
+            # If search fails, log but continue
+            print(f"Error in semantic search: {e}")
+            memory_result["reasoning"] += f" (Search error: {str(e)})"
+    
+    # If intent is "chat", route directly to chat
+    if result.intent == "chat":
+        return {
+            "memory_result": memory_result,
+            "next_worker": "chat",
+            "metadata": state.get("metadata", ReviewMetadata())
+        }
+    
+    # For other intents, continue to intent_router (which will handle CBT exercise creation)
+    return {
+        "memory_result": memory_result,
+        "next_worker": "intent_router" if result.intent != "chat" else "chat",
+        "metadata": state.get("metadata", ReviewMetadata())
+    }
+
 
 def intent_router_node(state: AgentState):
     messages = state["messages"]
